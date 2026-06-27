@@ -58,12 +58,23 @@ def train_arm(model, train_in, train_lab, valid_h, valid_t, pop_by_idx,
 
 @torch.no_grad()
 def eval_over_catalog(model, M, eval_pids, pid2evalidx, target_set,
-                      warm2idx, test_rows, maxlen, k, device):
+                      warm2idx, test_rows, maxlen, k, device,
+                      bias=None, normalize=False):
     """확장 catalog(M: (N,d))에 대해 target이 target_set에 속한 사용자만 평가한다.
 
     history는 warm2idx로 매핑(=WARM만), 이미 본 아이템은 후보에서 제외, full ranking.
     지표 정의는 baseline_popularity.evaluate()와 동일.
+
+    비대칭 scoring 지원 (실험 8):
+      normalize=True -> uv·M을 cosine으로 (uv와 M 행을 모두 단위 노름). bias 항과
+        섞을 때 cosine을 [-1,1]로 고정해 β를 해석 가능하게 만든다.
+      bias (N,) -> 점수에 더하는 per-item 항(예: β·log(1+train_pop)). cold는 train_pop=0
+        이라 bias=0이 자연스럽게 성립 -> warm에만 인기도 prior가 가산된다.
     """
+    if normalize:
+        M = M / (M.norm(dim=1, keepdim=True) + 1e-12)
+    if bias is not None and not torch.is_tensor(bias):
+        bias = torch.as_tensor(bias, dtype=torch.float32, device=device)
     recall = ndcg = 0.0
     n = 0
     for ex in test_rows:
@@ -75,7 +86,11 @@ def eval_over_catalog(model, M, eval_pids, pid2evalidx, target_set,
             continue
         seq = torch.as_tensor([T.pad_seq(hist, maxlen)], device=device)
         uv = model.user_vector(seq)                 # (1, d)
+        if normalize:
+            uv = uv / (uv.norm(dim=1, keepdim=True) + 1e-12)
         scores = (uv @ M.t()).squeeze(0).clone()    # (N,)
+        if bias is not None:
+            scores = scores + bias
         # 이미 본 WARM 아이템 제외 (catalog 내 index = warm2idx-1)
         seen = [warm2idx[p] - 1 for p in ex["history"] if p in warm2idx]
         scores[seen] = float("-inf")
@@ -169,6 +184,16 @@ def main():
     train_arm(tx_model, train_in, train_lab, valid_h, valid_t, pop_by_idx,
               device, args, "text")
 
+    print("[train] hybrid(frozen) arm ...", file=sys.stderr)
+    # hybrid: 학습되는 ID 테이블(WARM 전용) + frozen 텍스트 prior. text와 동일하게
+    # frozen이어야 학습된 projection을 미학습 COLD 아이템에도 적용할 수 있다.
+    hy_repr = ItemRepresentation("hybrid", Vw, args.d_model, text_matrix=warm_text,
+                                 train_text=False, dropout=args.dropout)
+    hy_model = SASRec(hy_repr, args.d_model, args.maxlen, args.n_layers,
+                      args.n_heads, args.dropout).to(device)
+    train_arm(hy_model, train_in, train_lab, valid_h, valid_t, pop_by_idx,
+              device, args, "hybrid")
+
     # --- 평가 catalog 구성 ---
     cold_items = sorted(cold_set)
     test_rows = read_jsonl(os.path.join(args.data_dir, "test.jsonl"))
@@ -192,12 +217,57 @@ def main():
     with torch.no_grad():
         M_tx = ir.text_norm(ir.text_proj(torch.as_tensor(E_eval, device=device)))
 
+    # hybrid catalog = WARM ∪ COLD. WARM은 id_emb + proj(text)(=matrix()의 학습된 행),
+    # COLD는 id 행이 없으므로 proj(text)만 적용 -> 자연스러운 zero-shot fallback.
+    eval_pids_hy = warm_items + cold_items                       # text와 동일 순서
+    pid2evalidx_hy = {p: i for i, p in enumerate(eval_pids_hy)}
+    hir = hy_model.item_repr
+    E_cold = np.stack([E[pid2row[p]] for p in cold_items]).astype(np.float32)
+    with torch.no_grad():
+        M_hy_warm = hir.matrix().detach()[1:].to(device)         # (Vw, d): id+proj(text)
+        M_hy_cold = hir.text_norm(hir.text_proj(                 # (n_cold, d): proj(text)만
+            torch.as_tensor(E_cold, device=device)))
+        M_hy = torch.cat([M_hy_warm, M_hy_cold], dim=0)
+
+    # L2 정규화 변형: catalog 각 행을 단위 노름으로 -> item쪽 cosine scoring.
+    # hybrid의 warm(id+text, 노름 큼) vs cold(text만, 노름 작음) 비대칭을 제거해
+    # cold가 랭킹에서 공정하게 경쟁하는지 검증. (user 벡터 정규화는 argsort 불변이라 생략)
+    def l2norm(M):
+        return M / (M.norm(dim=1, keepdim=True) + 1e-12)
+    M_hy_l2 = l2norm(M_hy)
+    M_tx_l2 = l2norm(M_tx)
+
     warm_set = set(warm_items)
+
+    # --- 실험 8: 비대칭 scoring = cosine + β·log(1+train_pop) ---
+    # cosine(=normalize=True)은 warm/cold를 방향으로 공정하게 비교(cold의 강점)하고,
+    # popularity bias는 L2가 버린 warm의 노름 신호를 명시적으로 복원한다. cold는 학습에서
+    # held-out -> train_pop=0 -> bias=0 자연 성립 -> warm에만 인기도 prior가 가산된다.
+    # β=0이면 순수 cosine(=실험 7의 hybrid_frozen_l2)이라 내부 검증도 된다.
+    pop_cat = np.array([float(item_pop[p]) for p in warm_items]
+                       + [0.0] * len(cold_items), dtype=np.float32)
+    logpop = np.log1p(pop_cat)                                   # (N,)
+    logpop = logpop / (logpop.max() + 1e-12)   # [0,1]로 정규화 -> β를 cosine 단위로
+    betas = [0.0, 0.05, 0.1, 0.15, 0.2, 0.3, 0.5]
+    asym = {}
+    for b in betas:
+        bias = b * logpop
+        asym[f"beta={b}"] = {
+            "cold": eval_over_catalog(
+                hy_model, M_hy, eval_pids_hy, pid2evalidx_hy, cold_set, warm2idx,
+                cold_rows, args.maxlen, args.k, device, bias=bias, normalize=True),
+            "warm": eval_over_catalog(
+                hy_model, M_hy, eval_pids_hy, pid2evalidx_hy, warm_set, warm2idx,
+                warm_ref_rows, args.maxlen, args.k, device, bias=bias, normalize=True),
+        }
+        print(f"[asym] β={b}: cold {asym[f'beta={b}']['cold']}  "
+              f"warm {asym[f'beta={b}']['warm']}", file=sys.stderr)
 
     # --- 결과 ---
     res = {
         "holdout_frac": args.holdout_frac,
         "warm_items": Vw, "cold_items": len(cold_set),
+        "asym_scoring_cosine_plus_beta_logpop": asym,
         "cold_target": {
             # ID: cold 타깃은 WARM catalog에 없음 -> 구조적 0. (참고로 catalog/타깃셋이
             #     겹치지 않아 n_eval은 동일 사용자 수로 맞추기 위해 text 경로로 카운트)
@@ -206,6 +276,15 @@ def main():
             "text_frozen": eval_over_catalog(
                 tx_model, M_tx, eval_pids_tx, pid2evalidx_tx, cold_set,
                 warm2idx, cold_rows, args.maxlen, args.k, device),
+            "hybrid_frozen": eval_over_catalog(
+                hy_model, M_hy, eval_pids_hy, pid2evalidx_hy, cold_set,
+                warm2idx, cold_rows, args.maxlen, args.k, device),
+            "hybrid_frozen_l2": eval_over_catalog(
+                hy_model, M_hy_l2, eval_pids_hy, pid2evalidx_hy, cold_set,
+                warm2idx, cold_rows, args.maxlen, args.k, device),
+            "text_frozen_l2": eval_over_catalog(
+                tx_model, M_tx_l2, eval_pids_tx, pid2evalidx_tx, cold_set,
+                warm2idx, cold_rows, args.maxlen, args.k, device),
         },
         "warm_target_reference": {
             "ID": eval_over_catalog(
@@ -213,6 +292,15 @@ def main():
                 warm2idx, warm_ref_rows, args.maxlen, args.k, device),
             "text_frozen": eval_over_catalog(
                 tx_model, M_tx, eval_pids_tx, pid2evalidx_tx, warm_set,
+                warm2idx, warm_ref_rows, args.maxlen, args.k, device),
+            "hybrid_frozen": eval_over_catalog(
+                hy_model, M_hy, eval_pids_hy, pid2evalidx_hy, warm_set,
+                warm2idx, warm_ref_rows, args.maxlen, args.k, device),
+            "hybrid_frozen_l2": eval_over_catalog(
+                hy_model, M_hy_l2, eval_pids_hy, pid2evalidx_hy, warm_set,
+                warm2idx, warm_ref_rows, args.maxlen, args.k, device),
+            "text_frozen_l2": eval_over_catalog(
+                tx_model, M_tx_l2, eval_pids_tx, pid2evalidx_tx, warm_set,
                 warm2idx, warm_ref_rows, args.maxlen, args.k, device),
         },
     }
